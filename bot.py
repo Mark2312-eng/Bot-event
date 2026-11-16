@@ -13,6 +13,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
 )
 
+# --- Настройки ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 XF_API_URL = os.getenv("XF_API_URL", "https://samp.date").rstrip("/")
 XF_API_KEY = os.getenv("XF_API_KEY")
@@ -20,7 +21,7 @@ XF_API_USER = os.getenv("XF_API_USER", "1")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 CUSTOM_FIELD_ID = os.getenv("CUSTOM_FIELD_ID", "vise_coins")
 DATABASE_URL = os.getenv("DATABASE_URL")
-PORT = int(os.getenv("PORT", "8080"))
+PORT = int(os.getenv("PORT", "10000"))
 
 SECRET_CODES = {
     "VISE-NY-01": 1.5, "VISE-NY-02": 1.5, "VISE-NY-03": 2.0,
@@ -39,46 +40,47 @@ SHOP_ITEMS = {
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vise-bot")
 
-db_pool: asyncpg.Pool | None = None
-bot: Bot | None = None
+db_pool = None
+bot = None
 dp = Dispatcher()
 
-# ---------- БД ----------
-
+# --- БД ---
 async def init_db():
     global db_pool
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL не задан")
+        log.error("DATABASE_URL не задан в переменных окружения!")
+        return
     db_url = DATABASE_URL
     if db_url.startswith("postgres://"):
         db_url = db_url.replace("postgres://", "postgresql://", 1)
-    db_pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=5)
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS event_users (
-                tg_id BIGINT PRIMARY KEY,
-                xf_id INTEGER NOT NULL,
-                xf_nick TEXT NOT NULL
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS used_codes (
-                id SERIAL PRIMARY KEY,
-                tg_id BIGINT NOT NULL,
-                code TEXT NOT NULL,
-                UNIQUE(tg_id, code)
-            );
-        """)
-    log.info("PostgreSQL подключена")
+    try:
+        db_pool = await asyncpg.create_pool(dsn=db_url, min_size=1, max_size=5)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS event_users (
+                    tg_id BIGINT PRIMARY KEY,
+                    xf_id INTEGER NOT NULL,
+                    xf_nick TEXT NOT NULL
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS used_codes (
+                    id SERIAL PRIMARY KEY,
+                    tg_id BIGINT NOT NULL,
+                    code TEXT NOT NULL,
+                    UNIQUE(tg_id, code)
+                );
+            """)
+        log.info("PostgreSQL успешно подключена!")
+    except Exception as e:
+        log.error(f"Ошибка подключения к БД: {e}")
 
 async def close_db():
     global db_pool
     if db_pool:
         await db_pool.close()
-        db_pool = None
 
-# ---------- XenForo ----------
-
+# --- XenForo ---
 def xf_headers():
     return {"XF-Api-Key": XF_API_KEY or "", "XF-Api-User": XF_API_USER}
 
@@ -130,8 +132,7 @@ def set_xf_user_balance(user_id: int, new_balance: float) -> bool:
         log.error(f"XF write error: {e}")
     return False
 
-def change_xf_balance(user_id: int, delta: float) -> float | None:
-    """Атомарно (в рамках одного процесса) меняет баланс. Возвращает новый баланс или None."""
+def change_xf_balance(user_id: int, delta: float) -> float:
     cur = get_xf_user_balance(user_id)
     new = cur + delta
     if new < 0:
@@ -140,14 +141,12 @@ def change_xf_balance(user_id: int, delta: float) -> float | None:
         return None
     return new
 
-# ---------- FSM ----------
-
+# --- FSM ---
 class EventStates(StatesGroup):
     waiting_for_nick = State()
     waiting_for_code = State()
 
-# ---------- Клавиатуры ----------
-
+# --- Клавиатуры ---
 def main_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -163,8 +162,7 @@ def shop_kb() -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=f"{title} — {price:g}", callback_data=f"buy:{key}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ---------- Хендлеры ----------
-
+# --- Хендлеры ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -174,11 +172,47 @@ async def cmd_start(message: types.Message, state: FSMContext):
         reply_markup=main_kb(),
     )
     await message.answer("Введи свой игровой ник:")
+    await state.set_state(EventStates.waiting_for_nick)
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.", reply_markup=main_kb())
+
+@dp.message(EventStates.waiting_for_nick)
+async def handle_nick(message: types.Message, state: FSMContext):
+    nick = (message.text or "").strip()
+    if not nick or len(nick) < 2 or len(nick) > 32:
+        await message.answer("Ник должен быть от 2 до 32 символов. Попробуй ещё:")
+        return
+    if not db_pool:
+        await message.answer("БД не готова, попробуй позже.")
+        return
+    await message.answer("🔎 Ищу пользователя на форуме...")
+    xf_user = await asyncio.to_thread(find_xf_user, nick)
+    if not xf_user:
+        await message.answer(
+            "❌ Пользователь с таким ником не найден на форуме.\n"
+            "Проверь написание и попробуй снова:"
+        )
+        return
+    xf_id = int(xf_user["user_id"])
+    xf_nick = xf_user["username"]
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO event_users(tg_id, xf_id, xf_nick)
+               VALUES($1, $2, $3)
+               ON CONFLICT (tg_id) DO UPDATE
+               SET xf_id = EXCLUDED.xf_id, xf_nick = EXCLUDED.xf_nick""",
+            message.from_user.id, xf_id, xf_nick,
+        )
+    await state.clear()
+    await message.answer(
+        f"✅ Привязано: <b>{xf_nick}</b> (ID {xf_id})\n"
+        f"Можешь вводить коды и покупать товары.",
+        parse_mode="HTML",
+        reply_markup=main_kb(),
+    )
 
 @dp.message(F.text == "👤 Мой профиль")
 async def profile(message: types.Message):
@@ -255,7 +289,6 @@ async def handle_code(message: types.Message, state: FSMContext):
             return
     new_bal = await asyncio.to_thread(change_xf_balance, row["xf_id"], reward)
     if new_bal is None:
-        # откат — если не удалось начислить, разрешаем повторно
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "DELETE FROM used_codes WHERE tg_id=$1 AND code=$2",
@@ -331,41 +364,6 @@ async def buy_cb(cb: types.CallbackQuery):
             log.warning(f"admin notify: {e}")
     await cb.answer("Готово")
 
-@dp.message(EventStates.waiting_for_nick)
-async def handle_nick(message: types.Message, state: FSMContext):
-    nick = (message.text or "").strip()
-    if not nick or len(nick) < 2 or len(nick) > 32:
-        await message.answer("Ник должен быть от 2 до 32 символов. Попробуй ещё:")
-        return
-    if not db_pool:
-        await message.answer("БД не готова, попробуй позже.")
-        return
-    await message.answer("🔎 Ищу пользователя на форуме...")
-    xf_user = await asyncio.to_thread(find_xf_user, nick)
-    if not xf_user:
-        await message.answer(
-            "❌ Пользователь с таким ником не найден на форуме.\n"
-            "Проверь написание и попробуй снова:"
-        )
-        return
-    xf_id = int(xf_user["user_id"])
-    xf_nick = xf_user["username"]
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO event_users(tg_id, xf_id, xf_nick)
-               VALUES($1, $2, $3)
-               ON CONFLICT (tg_id) DO UPDATE
-               SET xf_id = EXCLUDED.xf_id, xf_nick = EXCLUDED.xf_nick""",
-            message.from_user.id, xf_id, xf_nick,
-        )
-    await state.clear()
-    await message.answer(
-        f"✅ Привязано: <b>{xf_nick}</b> (ID {xf_id})\n"
-        f"Можешь вводить коды и покупать товары.",
-        parse_mode="HTML",
-        reply_markup=main_kb(),
-    )
-
 @dp.message()
 async def fallback(message: types.Message, state: FSMContext):
     current = await state.get_state()
@@ -375,12 +373,10 @@ async def fallback(message: types.Message, state: FSMContext):
     if current == EventStates.waiting_for_code.state:
         await handle_code(message, state)
         return
-    # если ничего не ждём — начинаем привязку ника
     await state.set_state(EventStates.waiting_for_nick)
     await message.answer("Введи свой игровой ник (как на форуме):")
 
-# ---------- Web healthcheck ----------
-
+# --- Web Healthcheck ---
 async def health(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "service": "vise-bot"})
 
@@ -392,19 +388,23 @@ async def start_web():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info(f"Web healthcheck на :{PORT}")
+    log.info(f"Web healthcheck запущен на порту {PORT}")
 
-# ---------- main ----------
-
+# --- Main ---
 async def main():
     global bot
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не задан")
+        log.error("BOT_TOKEN не задан! Бот не может запуститься.")
+        return
     if not XF_API_KEY:
-        raise RuntimeError("XF_API_KEY не задан")
+        log.warning("XF_API_KEY не задан! Функции форума не будут работать.")
+    
     await init_db()
     bot = Bot(token=BOT_TOKEN)
+    
+    # Запускаем веб-сервер ДО polling, чтобы Render увидел порт
     await start_web()
+    
     log.info("Бот запускается (polling)...")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
@@ -416,4 +416,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        log.info("Остановлен")
+        log.info("Бот остановлен")
