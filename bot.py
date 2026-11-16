@@ -59,41 +59,68 @@ async def init_db():
     logging.info("PostgreSQL подключена!")
 
 def xf_headers():
-    return {"XF-Api-Key": XF_API_KEY, "XF-Api-User": "1"}
+    return {
+        "XF-Api-Key": XF_API_KEY,
+        "XF-Api-User": "1",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
 
 def find_xf_user(username: str):
-    url = f"{XF_API_URL.rstrip('/')}/users/find-name"
-    try:
-        resp = requests.get(url, params={"username": username}, headers=xf_headers(), timeout=10)
-        logging.info(f"API {url} -> status {resp.status_code}")
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("exact"):
-                return data["exact"]
-            if data.get("recommendations"):
-                return data["recommendations"][0]
-    except Exception as e:
-        logging.error(f"XF search error ({url}): {e}")
+    urls = [
+        f"{XF_API_URL.rstrip('/')}/users/find-name",
+        "https://samp.date"
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, params={"username": username}, headers=xf_headers(), timeout=10)
+            logging.info(f"API {url} -> {resp.status_code} | Тело: {resp.text[:200]}")
+            if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                data = resp.json()
+                if data.get("exact"):
+                    return data["exact"]
+                if data.get("recommendations"):
+                    # Если API вернул список — берём первый элемент, чтобы не упасть ниже в коде
+                    return data["recommendations"][0] if isinstance(data["recommendations"], list) else data["recommendations"]
+        except Exception as e:
+            logging.error(f"XF search error ({url}): {e}")
     return None
 
 def get_xf_user_balance(user_id: int) -> float:
-    try:
-        resp = requests.get(f"{XF_API_URL.rstrip('/')}/users/{user_id}", headers=xf_headers(), timeout=10)
-        if resp.status_code == 200:
-            val = resp.json().get("user", {}).get("custom_fields", {}).get(CUSTOM_FIELD_ID, "0")
-            return float(str(val).replace(",", ".")) if val else 0.0
-    except Exception as e:
-        logging.error(f"XF read error: {e}")
+    urls = [
+        f"{XF_API_URL.rstrip('/')}/users/{user_id}",
+        f"https://samp.date{user_id}"
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=xf_headers(), timeout=10)
+            if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                val = resp.json().get("user", {}).get("custom_fields", {}).get(CUSTOM_FIELD_ID, "0")
+                return float(str(val).replace(",", ".")) if val else 0.0
+        except Exception as e:
+            logging.error(f"XF read error: {e}")
     return 0.0
 
 def set_xf_user_balance(user_id: int, new_balance: float) -> bool:
+    # Защита от передачи int вместо float
     try:
         new_balance = float(new_balance)
         formatted = int(new_balance) if new_balance.is_integer() else round(new_balance, 2)
-        resp = requests.post(f"{XF_API_URL.rstrip('/')}/users/{user_id}", data={f"custom_fields[{CUSTOM_FIELD_ID}]": str(formatted)}, headers=xf_headers(), timeout=10)
-        return resp.status_code == 200
     except Exception as e:
-        logging.error(f"XF write error: {e}")
+        logging.error(f"Balance format error: {e}")
+        return False
+
+    urls = [
+        f"{XF_API_URL.rstrip('/')}/users/{user_id}",
+        f"https://samp.date{user_id}"
+    ]
+    for url in urls:
+        try:
+            resp = requests.post(url, data={f"custom_fields[{CUSTOM_FIELD_ID}]": str(formatted)}, headers=xf_headers(), timeout=10)
+            if resp.status_code == 200 and resp.text.strip().startswith("{"):
+                return True
+        except Exception as e:
+            logging.error(f"XF write error: {e}")
     return False
 
 class EventStates(StatesGroup):
@@ -242,6 +269,7 @@ async def main():
     await init_db()
     app = web.Application()
     app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
